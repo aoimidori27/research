@@ -1,0 +1,413 @@
+#! /usr/local/bin/bash
+set -e
+qlen=20
+bw=10
+rtt=40
+margin=130
+length=10
+qdelay=`echo "$qlen*1500*8/($bw*1000)"|bc`
+srtt_min=$rtt
+srtt_max=`echo "$rtt+$qdelay+$margin"|bc`
+rto_min=200
+rto_max=`echo "$srtt_max*4+$margin/2"|bc`
+# parse options
+dir=$1
+dirname=`echo $dir | sed -e 's/\(.*\)\/\(.*\)$/\1/'`
+log=`echo $dir| sed -e 's/.*\/\(.*\)$/\1/'`
+
+# tcptrace with default flags
+tt="tcptrace -n"
+
+# pigz is multicore-capable
+#gunzip=unpigz
+gunzip=gunzip
+
+if [ -z $dir ]; then
+	echo "$0 <common_filename>"
+	exit
+fi
+
+if [ ! -f "$dir-fwd.pcap.gz" ]; then
+	echo $log-fwd.pcap.gz is missing
+	exit
+fi
+
+# use gnu sed (faster?)
+sed=sed
+
+extract_data() {
+	local i=$1
+	local d=$2
+
+	echo Extracting data for connection $i, direction $d
+
+	# get connection information
+
+	info=$($tt -b -o$i $dir-$d.pcap.gz 2> /dev/null | fgrep -v "**" | tail -n 1)
+
+	# extract four tuple data
+	src_ip=$(echo $info | cut -d: -f2 | tr -d " ")
+	src_port=$(echo $info | cut -d: -f3 | cut -d- -f1 | tr -d " ")
+	dst_ip=$(echo $info | cut -d- -f2 | cut -d: -f1 | tr -d " ")
+	dst_port=$(echo $info | cut -d: -f4 | cut -d\( -f1 | tr -d " ")
+
+	# extract the relevant siftr data into a separate file
+	# also change the delimiter from comma to space (for gnuplot)
+	if [ $d = "fwd" ]; then
+		pat="$src_ip,$src_port,$dst_ip,$dst_port"
+	else
+		pat="$dst_ip,$dst_port,$src_ip,$src_port"
+	fi
+
+	$gunzip -c $dir-$d.sift.gz | \
+		fgrep "$pat" | \
+		tr "," " " > /tmp/$log-$i-$d.sift
+	# extract the seq and ack tcpdump traces
+	for t in seq ack ; do
+		if [ "$t" = "seq" ]; then
+			pat=IP
+		else
+			pat=">"
+		fi
+		if [ $d = "fwd" ]; then
+			pat="$pat $src_ip.$src_port"
+		else
+			pat="$pat $src_ip.$src_port"
+			#pat="$pat $dst_ip.$dst_port"
+		fi
+		# extract and synthesize some dummy seq, ack and sack values so plotting is easier
+		tcpdump -n -tt -K -S -r /tmp/$log-$i-$d.pcap 2> /dev/null | \
+			fgrep "$pat" | \
+			tr -s ":{}," " " | \
+			$sed -E -e 's/(\[.*\]) seq ([0-9]+) win/\1 seq \2 \2 ack - win/g' \
+					-e 's/(\[.*\]) seq ([0-9]+) ack/\1 seq \2 - ack/g' \
+					-e 's/\] ack/] seq - - ack/g' \
+					-e 's/win 65535(.*)wscale/win -\1wscale/' \
+					-e 's/sack 1 ([0-9]+) ([0-9]+)/sack 1 \1 \2 - - - - - -/g'\
+					-e 's/sack 2 ([0-9]+) ([0-9]+) ([0-9]+) ([0-9]+)/sack 2 \1 \2 \3 \4 - - - -/g' \
+					-e 's/sack 3 ([0-9]+) ([0-9]+) ([0-9]+) ([0-9]+) ([0-9]+) ([0-9]+)/sack 3 \1 \2 \3 \4 \5 \6 - -/g' \
+					-e 's/sack 4 ([0-9]+) ([0-9]+) ([0-9]+) ([0-9]+) ([0-9]+) ([0-9]+) ([0-9]+) ([0-9]+)/sack 3 \1 \2 \3 \4 \5 \6 \7 \8/g'\
+					> /tmp/$log-$i-$d.$t.dump
+		if [ $d = "fwd" ]; then
+			# calc throughput
+			cat /tmp/$log-$i-$d.seq.dump| \
+			sed -e 's/\([0-9+].[0-9+]\) IP \(.*\) length \([0-9+]\)/\1 \3/'| \
+			awk '
+			BEGIN { curtime = 0
+				bytes = 0
+			}
+			{
+				if ($1 >= curtime + 0.05 ) {
+					if (curtime > 0) {
+						print curtime,bytes*8/(($1-curtime))
+					}
+					curtime = $1
+					bytes = $2
+				} else {
+					bytes += $2
+				}
+			} ' > /tmp/$log-$i-$d.thrput
+
+			# extract and synthesize some dummy seq, ack and sack values that are CWR marked in TCP header so plotting is easier 
+			tcpdump -n -tt -K -S -r /tmp/$log-$i-$d.pcap 'tcp[13] & 0x80' != 0 2> /dev/null | \
+				fgrep "$pat" | \
+				tr -s ":{}," " " | \
+				$sed -E -e 's/(\[.*\]) seq ([0-9]+) win/\1 seq \2 \2 ack - win/g' \
+						-e 's/(\[.*\]) seq ([0-9]+) ack/\1 seq \2 - ack/g' \
+						-e 's/\] ack/] seq - - ack/g' \
+						-e 's/win 65535(.*)wscale/win -\1wscale/' \
+						-e 's/sack 1 ([0-9]+) ([0-9]+)/sack 1 \1 \2 - - - - - -/g'\
+						-e 's/sack 2 ([0-9]+) ([0-9]+) ([0-9]+) ([0-9]+)/sack 2 \1 \2 \3 \4 - - - -/g' \
+						-e 's/sack 3 ([0-9]+) ([0-9]+) ([0-9]+) ([0-9]+) ([0-9]+) ([0-9]+)/sack 3 \1 \2 \3 \4 \5 \6 - -/g' \
+						-e 's/sack 4 ([0-9]+) ([0-9]+) ([0-9]+) ([0-9]+) ([0-9]+) ([0-9]+) ([0-9]+) ([0-9]+)/sack 3 \1 \2 \3 \4 \5 \6 \7 \8/g'\
+				>> /tmp/$log-$i-$d.cwr.dump
+		fi
+	done
+
+	# find retransmissions and extract them into a separate file
+	awk '
+		BEGIN {	max_seq = -1 }
+		{		if ($9 <= max_seq - 40000000) {
+					max_seq = $9					
+				} else if ($9 <= max_seq) {
+					print $0
+				} else {
+					max_seq = $9
+				}
+		}' /tmp/$log-$i-$d.seq.dump > /tmp/$log-$i-$d.seq.rtx.dump
+}
+
+
+plot() {
+	local i=$1
+	local d=$2
+	
+	# stupid heuristic: for each 500K filesize of the dump file,
+	# increase the sample interval of the file by 1 (skipping one more line)
+	if [ `uname` = "Linux" ]; then
+		local s=$(stat -c%s /tmp/$log-$i-$d.seq.dump)
+	else
+		local s=$(stat -f%z /tmp/$log-$i-$d.seq.dump)
+	fi
+
+	local sample=$((s/500000+1))
+	
+	echo "Plotting every $sample sample(s) of connection $i, direction $d"
+	if [ $d = "fwd" ]; then
+		seqd_min=`head -n1 /tmp/$log-$i-$d.seq.dump | tr -s " "| cut -f1 -d " "`
+		ackd_min=`head -n1 /tmp/$log-$i-$d.ack.dump | tr -s " "| cut -f1 -d " "`
+		ret=`echo "$seqd_min > $ackd_min"|bc`
+		if [ $ret -eq 1 ]; then
+			time_min=$ackd_min
+		else
+			time_min=$seqd_min 
+		fi
+
+		gnuplot 2> >(fgrep -v "Skipping data file with no valid points") <<-STOP1 || exit
+		set term pdfcairo enh font "Times,7"
+    	    	set out "$dir-$i-$d.pdf"
+    	    	# line width
+    	    	LW=1.5
+    	    	LW2=2
+    	    	# point size (used in macroview for segments)
+    	    	STANDARDPS=0.1 #standardsegments
+    	    	OTHERPS=0.8 #retransmit, reorders etc are plotted big
+
+    	    	# styles, nohead for line, heads for arrows
+    	    	# for aditional colors check
+    	    	# http://www.uni-hamburg.de/Wiss/FB/15/Sustainability/schneider/gnuplot/colors.htm
+    	    	#
+    	    	# reminder: label defaults are in xpl2pdf.py
+    	    	#
+    	    	set style line  1 lt 0 lw 3 lc rgb "blue" # snd.nxt
+    	    	set style line  2 lw LW lc rgb "#32CD32" #ack
+    	    	set style line  3 lw LW lc rgb "black" #data
+    	    	set style line  4 lw LW lc rgb "red" #retransmit
+    	    	set style line  5 lw LW lc rgb "cyan" #reorder
+    	    	set style line  6 lw LW lc rgb "magenta" #hw_dup
+    	    	set style line  7 lw LW lc rgb "purple" #sack
+    	    	set style line  8 lw LW lc rgb "orange" pt 13 # ecn 
+    	    	set style line  9 lc rgb "#808000" lw LW2 #Olive
+    	    	#set style line 10 lt rgb "#C71585" lw LW 1 #MediumVioletRed
+    	    	set style line 11 lt rgb "red" lw LW2 #red      
+    	    	set style line 12 lt rgb "#006400" lw 1  #DarkGreen
+    	    	set style line 13 lc rgb "#00008B" lw 2 #DarkBlue        
+    	    	set style line 14 lt rgb "#006400" lw 2 pt 7 ps 1 #DarkGreen
+    	    	set style line 15 lt rgb "#4B0082" lw 2 #indigo
+    	    	set style line 16 lt rgb "#6B8E23" lw LW pt 7 ps 1 #OliveDrab
+    	    	set style line 17 lt rgb "#8B008B" lw LW pt 7 ps 1 #DarkMagenta
+    	    	set style line 18 lt rgb "#E9967A" lw LW pt 7 ps 1 #DarkSalmon
+    	    	set style line 19 lt rgb "#4169E1" lw LW pt 7 ps 1 #RoyalBlue
+    	    	set style line 20 lw LW2 lt 3 lc rgb "black" #ForestGreen
+    	    	set style line 10 linecolor rgbcolor "#F0F0F0"
+
+		set multiplot layout 4, 1
+    	    	set key autotitle column nobox samplen 1 noenhanced
+    	    	#set title "Trace $log, connection $i, direction $d"
+    	    	set pointsize .25
+    	    	set bars .25
+    	    	set key left top Left reverse
+    	    	set grid ytics back linestyle 10
+    	    	set tics font "Times,7.93"
+    	    	set xlabel font "Times,8"
+    	    	set ylabel font "Times,8"
+    	    	set y2label font "Times,8"
+    	    	set key font "Times,8"
+    	    	set border back
+    	    	set lmargin at screen 0.1
+    	    	set rmargin at screen 0.925
+    	    	set y2range [0:*]
+    	    	#set yrange [0:*]
+
+    	    	seq_min=`head -n1 /tmp/$log-$i-$d.seq.dump| tr -s " "| cut -f9 -d " "`.0
+    	    	seqd_min=`head -n1 /tmp/$log-$i-$d.seq.dump | tr -s " "| cut -f1 -d " "`
+    	    	seqd_max=`tail -n1 /tmp/$log-$i-$d.seq.dump | tr -s " "| cut -f1 -d " "`
+    	    	ackd_min=`head -n1 /tmp/$log-$i-$d.ack.dump | tr -s " "| cut -f1 -d " "`
+    	    	ackd_max=`tail -n1 /tmp/$log-$i-$d.ack.dump | tr -s " "| cut -f1 -d " "`
+    	    	time_min=(seqd_min < ackd_min ? seqd_min : ackd_min)
+    	    	time_max=(seqd_max > ackd_max ? seqd_max : ackd_max)
+    	    	set xrange [0:time_max-time_min]
+
+    	    	# plot 1 (sequence number)
+		set format x''
+		set format y '%5.1l x 10^{%L}'
+		#set ytics ( '%5d' 20000, '%5d' 40000, '%5d' 60000, '%5d' 80000 )
+		set ytics 2000000
+		#set yrange [0:40000]
+		set ylabel "Sequence Number"
+		plot '/tmp/$log-$i-$d.ack.dump' every $sample \
+			using (\$1-time_min):(\$12-seq_min) \
+			with steps \
+			linestyle 2 \
+			title "ACK", \
+		'' every $sample \
+			using (\$1-time_min):(\$12-seq_min):(\$27-seq_min):(\$28-seq_min) \
+			with yerrorbars \
+			linestyle 7 \
+			pointsize 0 \
+			title "SACK", \
+		'' every $sample \
+			using (\$1-time_min):(\$12-seq_min):(\$29-seq_min):(\$30-seq_min) \
+			with yerrorbars \
+			linestyle 7 \
+			pointsize 0 \
+			notitle, \
+		'' every $sample \
+			using (\$1-time_min):(\$12-seq_min):(\$31-seq_min):(\$32-seq_min) \
+			with yerrorbars \
+			linestyle 7 \
+			pointsize 0 \
+			notitle, \
+		'' every $sample \
+			using (\$1-time_min):(\$12-seq_min):(\$33-seq_min):(\$34-seq_min) \
+			with yerrorbars \
+			linestyle 7 \
+			pointsize 0 \
+			notitle, \
+		'/tmp/$log-$i-$d.seq.dump' every $sample \
+			using (\$1-time_min):(\$9-seq_min):(\$9-seq_min):(\$10-seq_min) \
+			with yerrorbars \
+			linestyle 3 \
+			pointsize 0 \
+			title "seq #", \
+		'/tmp/$log-$i-$d.seq.rtx.dump' every $sample \
+			using (\$1-time_min):(\$9-seq_min):(\$9-seq_min):(\$10-seq_min) \
+			with yerrorbars \
+			linestyle 4 \
+			pointsize 0 \
+			title "RTX", \
+		'/tmp/$log-$i-$d.cwr.dump' every $sample \
+			using (\$1-time_min):(\$9-seq_min > 0 ? \$9-seq_min : 0) \
+			with points \
+			linestyle 8 \
+			pointsize 0.4 \
+			title "CWR"
+
+		# plot 2 (ssthresh)
+		unset title
+		set key right top 
+		set bmargin 0
+		set tmargin 1
+		set format x''
+		set xlabel ''
+		#set format y '%5.1l x 10^{%L}'
+		set ytics ( '%5d' 20000, '%5d' 40000)
+		set ytics 20000
+		set yrange [0:40000]
+		set ylabel "Bytes\n"
+		plot '/tmp/$log-$i-$d.sift' every $sample \
+			using (\$3-time_min):(\$8 >= 7187152 ? 0: \$8) \
+			with steps \
+			linestyle 9 \
+			title "ssthresh", \
+		'' every $sample \
+			using (\$3-time_min):(\$9 == 1073725440 ? 0: \$9) \
+			with steps \
+			linestyle 11 \
+			title "cwnd"
+
+		# plot 3 (srtt, rto)
+		set key left top Left reverse
+		set bmargin 0
+		set tmargin 1
+		set ytics $rtt
+		set format x ''
+		set format y '%g'
+		set ylabel "SRTT [ms]\n\n\n"
+		set y2label "RTO [ms]"
+		set yrange[$srtt_min:$srtt_max]
+		set y2range[$rto_min:$rto_max]
+		set ytics nomirror
+		set y2tics
+		plot '/tmp/$log-$i-$d.sift' every $sample \
+			using (\$3-time_min):(1000*\$17/($tcp_rtt_scale*$hz)) \
+			with steps \
+			linestyle 6 \
+			title "SRTT", \
+		'' every $sample \
+			using (\$3-time_min):(1000*\$20/$hz > 1000 ? 200 : 1000*\$20/$hz) \
+			with steps \
+			linestyle 13 \
+			title "RTO" \
+			axes x1y2
+		set y2label ""
+		set ytics mirror
+		unset y2tics
+		unset ytics
+
+		# plot 4 (throughput)
+		set bmargin 4
+		set tmargin 1
+		set ytics 1
+		set format x '%.1f'
+		set xlabel "Time [s]"
+		set ylabel "Throughput\n[Mbps]\n\n\n"
+		set yrange[0:4]
+		set ytics ( '1' 1, '2' 2, '3' 3, '4' 4 )
+		plot '/tmp/$log-$i-$d.thrput' \
+		 	using (\$1-time_min):(\$2/(1000*1000)) \
+		 	with l \
+		 	linestyle 15 \
+		 	notitle
+		unset multi
+STOP1
+	fi
+}
+
+
+# process in parallel
+for d in fwd; do
+	# detect number of connections in the trace
+	n=$($tt -b $dir-$d.pcap.gz 2> /dev/null | fgrep -v "**" | tail -n 1 | cut -d: -f1)
+
+	if [ "$n" = "no traced TCP packets" -o "$n" = "" ]; then
+		echo No TCP packets in the trace
+		exit
+	else
+		echo $n TCP connection\(s\) in the $d trace
+	fi
+
+	# split the trace files (and remove unneeded files)
+	$gunzip -c $dir-$d.pcap.gz | tcpsplit - $dir.%d-$d.pcap $n
+	#$gunzip $dir-$d.pcap.gz 
+	#echo tcpsplit $dir-$d.pcap $dir.%d-$d.pcap $n 
+	#gzip $dir-$d.pcap
+	rm $dir.weird-$d.pcap
+
+	# extract parameters from siftr header and footer;
+	# store them in global variables of the same name
+	export $($gunzip -c $dir-$d.sift.gz | head -n1 | tr "\t" "\n")
+	export $($gunzip -c $dir-$d.sift.gz | tail -n1 | tr "\t" "\n")
+
+	# analyze each connection
+	for ((i = $n; i >= 1; i-- )); do
+		# tcpsplit has numbered traces starting at zero, not one, so rename
+		mv $dir.$((i-1))-$d.pcap /tmp/$log-$i-$d.pcap
+	
+		# analyze
+		extract_data $i $d &
+	done
+done
+wait
+
+# plot in parallel
+for d in fwd; do
+	for ((i = $n; i >= 1; i-- )); do
+		plot $i $d &
+	done
+done
+wait
+
+# and clean up more
+for d in fwd; do
+	for ((i = $n; i >= 1; i-- )); do
+		if [ $d = "fwd" ]; then
+			rm /tmp/$log-$i-$d.cwr.dump
+		fi
+		rm /tmp/$log-$i-$d.pcap /tmp/$log-$i-$d.sift \
+		/tmp/$log-$i-$d.seq.dump /tmp/$log-$i-$d.seq.rtx.dump \
+		/tmp/$log-$i-$d.thrput \
+		/tmp/$log-$i-$d.ack.dump 
+	done
+done
+rm trace_* 2> /dev/null

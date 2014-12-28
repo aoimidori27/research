@@ -1,0 +1,26 @@
+
+This directory contains two bash scripts for a TCP connection measurement.
+One script named 'cap-netperf' is for measurement. This script configures tcpdump,
+and siftr and then generates traffic. Afterwards, this script output trace log
+in the same directory.
+
+One script named 'vis-netperf' generates a result as a PDF file. The result
+shows 5 plots: TCP sequence processing, CWND and ssthresh, SRTT and RTO, and
+throughput.
+The current script visualizes a sender behavior only. If you add a receiver's
+one, edit both cap-netperf and vis-netperf.
+Note: Install gnuplot, tcptrace and tcpsplit before running this script.
+
+Example Usage
+=============
+Suppose that a dummynet node configures 10.1.0.3, a sender node configures
+10.1.0.5 on em0 and a receiver node configures 10.1.0.7 on em1.
+(1) Start the netperf "netserver" on one machine:
+    root@seven:~ # netserver
+(2) Run a trace over one path:
+    root@five:~/siftr-plot # ./cap-netperf 10.1.0.5 em0 10.1.0.7 em1 10.0.5.3 1 dctcp
+(3) The previous step produced a bunch of trace files prefixed with
+    "10.1.0.5-10.1.0.7.*". Use "vis-netperf" to plot them:
+    root@five:~/siftr-plot # ./vis-netperf 10.1.0.5-10.1.0.7
+(4) You will now have a PDF file called
+    10.1.0.5-10.1.0.7-1-fwd.pdf

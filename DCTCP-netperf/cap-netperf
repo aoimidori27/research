@@ -1,0 +1,132 @@
+#! /usr/local/bin/bash
+set -e
+
+# parse options
+local_ip=$1
+local_if=$2
+peer_ip=$3
+peer_if=$4
+dn=$5
+ecn=$6
+ccalgo=$7
+
+# start a round-robin test to measure bufferbloat in the background
+len=10
+interval=.05
+# ssh with default parameters
+ssh="ssh $peer_ip"
+ssh2dn="ssh $dn"
+
+# pigz is multicore-capable
+gzip=pigz
+
+if [ -z "$ccalgo" ]; then
+	echo $0 '<local_ip> <local_if> <peer_ip> <peer_if> <dn_ip> <ecn> <ccalgo>'
+	exit
+fi
+
+# set a sysctl variable and remember the current value (local & remote)
+set() {
+	local var=$1
+	local val=$2
+	local tag=${var//\./}
+	
+	# remember current local value and set new one locally
+	export old_$tag=$(sysctl -n $var)
+	sudo sysctl -w $var=$val > /dev/null
+
+	# remember current remote value and set new one remotely
+	export old_peer_$tag=$($ssh sysctl -n $var)
+	$ssh sudo sysctl -w $var=$val > /dev/null
+	
+	echo $var = $val
+}
+
+
+# reset a sysctl variable to its remembered value (local & remote)
+reset() {
+	local var=$1
+	local oldval=old_${var//\./}
+	local oldpeerval=old_peer_${var//\./}
+
+	sudo sysctl -w $var=${!oldval} > /dev/null
+	$ssh sudo sysctl -w $var=${!oldpeerval} > /dev/null
+
+	echo $var = ${!oldval}
+}
+
+# start packet capture
+echo "local=$local_ip peer=$peer_ip dnnode=$dn ecn=$ecn peer_ccalgo=$ccalgo"
+
+if [ $ecn -eq 0 ]; then
+	dir="../cap/$ccalgo-noecn/"
+else
+	dir="../cap/$ccalgo/"
+fi
+
+if [ ! -d $dir ]; then
+	echo "create new dir $dir"
+	mkdir -p $dir
+fi
+
+curdir=`pwd`
+$ssh2dn sudo $curdir/dn.sh add $local_ip $peer_ip $ecn
+
+echo Make temp files
+pcap=$(mktemp)
+sift=$(mktemp)
+ping=$(mktemp)
+$ssh touch $pcap $sift
+
+# disable TSO
+set net.inet.tcp.tso 0
+
+# enable ECN
+set net.inet.tcp.ecn.enable $ecn
+set net.inet.tcp.experimental.initcwnd10 0
+set net.inet.tcp.cc.algorithm $ccalgo
+
+# set siftr log file and enable siftr 
+echo Enable siftr
+# set to zero first in case an earlier run died
+set net.inet.siftr.enabled 0
+set net.inet.siftr.logfile $sift
+set net.inet.siftr.enabled 1
+
+# start packet capture
+echo "Start tcpdump between $local_ip and $peer_ip on $local_if (local) and $peer_if (remote)"
+
+td="tcpdump -q -s 120"
+sudo $td -i $local_if -w $pcap host $local_ip and host $peer_ip and not port 12865 and not port 22 2> /dev/null &
+td_pid=$!
+#td_pid_peer=$($ssh "nohup sudo $td -i $peer_if -w $pcap host $peer_ip and host $local_ip and not port 5001 and not port 22 >& /dev/null &")
+
+# generate some measurement traffic!
+echo Run netperf
+netperf="netperf -H $peer_ip"
+
+# now start the bulk transfer
+$netperf -t TCP_STREAM -l $len #> /dev/null
+sleep .5
+
+# kill the local and remote tcpdumps after waiting for a few seconds for the logs to flush
+echo Stop tcpdump
+kill $td_pid
+#$ssh kill $td_pid_peer
+
+# disable siftr and restore old logfile destination
+echo Disable siftr
+set net.inet.siftr.enabled 0
+reset net.inet.siftr.logfile
+
+# gzip, save and rename local log files, store in script directory
+echo Save local logs
+out="$local_ip-$peer_ip"
+$gzip -c $pcap > $dir/$out-fwd.pcap.gz
+$gzip -c $sift > $dir/$out-fwd.sift.gz
+
+# XXX HACK!
+rm $pcap $sift
+
+# make files world readable
+sudo chmod a+r $dir/$out-fwd.pcap.gz $dir/$out-fwd.sift.gz
